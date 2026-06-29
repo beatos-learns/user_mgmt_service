@@ -1,0 +1,16 @@
+# Hadolint config for this repo.
+# Lint manually:
+#   docker run --rm -v "${PWD}:/repo" hadolint/hadolint hadolint --config /repo/.hadolint.yaml /repo/Dockerfile
+# build-image.ps1 runs this automatically before building (bypass: $env:SKIP_LINT=1).
+
+# Block the build only on warnings/errors; info & style are reported but don't fail.
+failure-threshold: warning
+
+ignored:
+  - DL3059   # Consecutive RUN instructions are intentional: readable, separately-cached build steps.
+  - DL3041   # microdnf packages (unzip/wget/binutils) are intentionally unpinned; Oracle Linux repo versions roll forward.
+
+# Base images may only come from these registries (the `scratch` pseudo-image is always allowed).
+trustedRegistries:
+  - ghcr.io
+  - docker.io
