@@ -1,0 +1,63 @@
+# docker-compose.yaml | run the user service and PostgreSQL.
+#
+# App config from .env (compose auto-loads it for ${...} interpolation)
+#
+# Recommended flow gets the zstd "baked" image (Gradle version + :latest):
+#   .\build-image.ps1            # build the baked image first
+#   docker compose up -d         # start DB, then the service once the DB is healthy
+# Or let compose build it itself (runtime-identical, gzip layers [bigger Image]):
+#   docker compose up -d --build
+name: user-mgmt
+
+services:
+  db:
+    image: postgres:17-alpine
+    networks:
+      - user-mgmt-net
+    # Credentials mirror .env (SPRING_DATASOURCE_*), so the app and DB agree.
+    environment:
+      POSTGRES_USER: ${SPRING_DATASOURCE_USERNAME:-postgres}
+      POSTGRES_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-postgres}
+      POSTGRES_DB: postgres
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    # The service start is gated on this becoming healthy.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SPRING_DATASOURCE_USERNAME:-postgres} -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    # Uncomment to reach the DB from the host for debugging:
+    # ports:
+    #   - "5432:5432"
+
+  user-service:
+    # The baked image: build-image.ps1 / docker-bake.hcl tag it :<version> and :latest.
+    image: ${IMAGE_NAME:-user-mgmt-service}:${IMAGE_TAG:-latest}
+    networks:
+      - user-mgmt-net
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        IMAGE_NAME: ${IMAGE_NAME:-user-mgmt-service}
+        VERSION: ${VERSION:-dev}
+    depends_on:
+      db:
+        condition: service_healthy
+    # All app config from the .env
+    env_file:
+      - .env
+    # override the datasource host: localhost to the `db` service on the compose network.
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/postgres
+    ports:
+      - "8080:8080"
+
+networks:
+  user-mgmt-net:
+    driver: bridge
+
+volumes:
+  db-data:

@@ -13,6 +13,7 @@ RUN ln -s /opt/gradle-${GRADLE_VERSION}/bin/gradle /usr/local/bin/gradle
 ## Sources
 WORKDIR /build
 COPY build.gradle settings.gradle ./
+COPY build-helper/gen-reachability-metadata.sh ./scripts/
 COPY src/ ./src/
 
 ## GraalVM native-image configuration.
@@ -30,6 +31,10 @@ graalvmNative {
     }
 }
 EOF
+
+# Resolve dependencies for native build
+RUN gradle --no-daemon compileJava
+RUN sh scripts/gen-reachability-metadata.sh
 
 # /build/build/native/nativeCompile/usr-srv | image name + flags from build.gradle
 RUN gradle --no-daemon clean nativeCompile

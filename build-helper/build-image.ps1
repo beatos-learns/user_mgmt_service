@@ -4,7 +4,8 @@
 #   .\build-image.ps1 --push     # build and push the zstd layers to a registry
 # Lints the Dockerfile with hadolint before building; bypass with: $env:SKIP_LINT=1
 $ErrorActionPreference = 'Stop'
-$root = $PSScriptRoot
+$root = Split-Path -Parent $PSScriptRoot
+Set-Location -Path $root
 
 # Lint the Dockerfile
 if (-not $env:SKIP_LINT) {
