@@ -32,6 +32,79 @@ services:
     # ports:
     #   - "5432:5432"
 
+  traefik:
+    image: traefik:v3.7.5
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+    networks:
+      - user-mgmt-net
+
+    ports:
+      - "80:80"
+      - "443:443"
+
+    volumes:
+      - traefik-sock:/var/run/docker.sock
+      - traefik-cert:/certs
+      - traefik-dynamic:/dynamic
+
+    command:
+      # EntryPoints
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.websecure.http.tls=true"
+
+      # Attach the static configuration tls.yaml file that contains the tls configuration settings
+      - "--providers.file.filename=/dynamic/tls.yaml"
+
+      # Providers
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=proxy"
+
+      # API & Dashboard
+      - "--api.dashboard=true"
+      - "--api.insecure=false"
+
+      # Observability
+      - "--log.level=INFO"
+      - "--accesslog=true"
+      - "--metrics.prometheus=true"
+
+    # Traefik Dynamic configuration via Docker labels
+    labels:
+      # Enable self‑routing
+      - "traefik.enable=true"
+
+      # Dashboard router
+      - "traefik.http.routers.dashboard.rule=Host(`dashboard.docker.localhost`)"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      - "traefik.http.routers.dashboard.tls=true"
+
+      # Basic‑auth middleware
+      - "traefik.http.middlewares.dashboard-auth.basicauth.users=<PASTE_HASH_HERE>"
+      - "traefik.http.routers.dashboard.middlewares=dashboard-auth@docker"
+
+  # Whoami application
+  whoami:
+    image: traefik/whoami
+    container_name: whoami
+    restart: unless-stopped
+    networks:
+      - user-mgmt-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.whoami.rule=Host(`whoami.docker.localhost`)"
+      - "traefik.http.routers.whoami.entrypoints=websecure"
+      - "traefik.http.routers.whoami.tls=true"
+
+
   user-service:
     # The baked image: build-image.ps1 / docker-bake.hcl tag it :<version> and :latest.
     image: ${IMAGE_NAME:-user-mgmt-service}:${IMAGE_TAG:-latest}
@@ -52,8 +125,8 @@ services:
     # override the datasource host: localhost to the `db` service on the compose network.
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/postgres
-    ports:
-      - "8080:8080"
+    #ports:
+    #  - "8080:8080"
 
 networks:
   user-mgmt-net:
@@ -61,3 +134,6 @@ networks:
 
 volumes:
   postgres-data:
+  traefik-sock:
+  traefik-cert:
+  traefik-dynamic:
