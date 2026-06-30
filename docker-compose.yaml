@@ -10,8 +10,8 @@
 name: user-mgmt
 
 services:
-  db:
-    image: postgres:17-alpine
+  postgres:
+    image: postgres:16-alpine
     networks:
       - user-mgmt-net
     # Credentials mirror .env (SPRING_DATASOURCE_*), so the app and DB agree.
@@ -20,7 +20,7 @@ services:
       POSTGRES_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-postgres}
       POSTGRES_DB: postgres
     volumes:
-      - db-data:/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql/data
     # The service start is gated on this becoming healthy.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${SPRING_DATASOURCE_USERNAME:-postgres} -d postgres"]
@@ -44,14 +44,14 @@ services:
         IMAGE_NAME: ${IMAGE_NAME:-user-mgmt-service}
         VERSION: ${VERSION:-dev}
     depends_on:
-      db:
+      postgres:
         condition: service_healthy
     # All app config from the .env
     env_file:
       - .env
     # override the datasource host: localhost to the `db` service on the compose network.
     environment:
-      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/postgres
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/postgres
     ports:
       - "8080:8080"
 
@@ -60,4 +60,4 @@ networks:
     driver: bridge
 
 volumes:
-  db-data:
+  postgres-data:
