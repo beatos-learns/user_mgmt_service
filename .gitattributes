@@ -1,0 +1,4 @@
+# Shell scripts run inside Linux build containers (Dockerfile: `sh scripts/...`);
+# force LF so Windows checkouts (core.autocrlf) don't break them with CRLF.
+*.sh text eol=lf
+gradlew text eol=lf
