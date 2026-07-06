@@ -28,13 +28,19 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     # The service start is gated on this becoming healthy.
+    # -h 127.0.0.1 forces TCP: without it pg_isready hits the unix socket, which
+    # already answers during initdb's temporary bootstrap server on a fresh volume.
+    # start_interval (fast probing during start_period) needs Docker Engine 25+.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${SPRING_DATASOURCE_USERNAME:-postgres} -d postgres"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${SPRING_DATASOURCE_USERNAME:-postgres} -d postgres"]
+      interval: 30s
       timeout: 3s
-      retries: 10
-      start_period: 10s
-    # No ports: the DB is never exposed to the host, only reachable in-network.
+      retries: 5
+      start_period: 30s
+      start_interval: 2s
+    # Uncomment to reach the DB from the host for debugging:
+    # ports:
+    #   - "5432:5432"
 
   traefik:
     image: traefik:v3.7.5
@@ -79,7 +85,20 @@ services:
       - "--accesslog=true"
       - "--metrics.prometheus=true"
 
-    # Dashboard routing + auth via Docker labels
+      # Ping endpoint for the healthcheck (internal "traefik" entrypoint :8080, not published)
+      - "--ping=true"
+
+    # `traefik healthcheck` parses the flags it is given and probes its own
+    # /ping endpoint, so --ping is needed both here and in `command`.
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+      start_interval: 2s
+
+    # Traefik Dynamic configuration via Docker labels
     labels:
       - "traefik.enable=true"
 
@@ -93,6 +112,42 @@ services:
 
       # Basic-auth middleware (user: bos-admin). Hash lives in .env; $ is escaped as $$.
       - "traefik.http.middlewares.dashboard-auth.basicauth.users=${TRAEFIK_DASHBOARD_AUTH}"
+      # Basic‑auth middleware
+      - "traefik.http.middlewares.dashboard-auth.basicauth.users=<PASTE_HASH_HERE>"
+      - "traefik.http.routers.dashboard.middlewares=dashboard-auth@docker"
+
+  # Whoami application
+  whoami:
+    # Stock traefik/whoami is FROM scratch (just the whoami binary, no shell),
+    # so it cannot exec a healthcheck. Extend it with a static busybox so the
+    # healthcheck below can wget-probe the app.
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM traefik/whoami:v1.11.0
+        COPY --from=busybox:1.36.1-musl /bin/busybox /busybox
+    # Build-only service: rebuild on every `up` so base-image bumps in
+    # dockerfile_inline aren't silently ignored (the build is fully cached).
+    pull_policy: build
+    container_name: whoami
+    restart: unless-stopped
+    networks:
+      - user-mgmt-net
+    # Probe the immutable /api endpoint — /health is whoami's failure-simulation
+    # knob (any peer can POST a 503 there) and would make health spoofable.
+    healthcheck:
+      test: ["CMD", "/busybox", "wget", "-q", "-O", "-", "http://127.0.0.1:80/api"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+      start_interval: 2s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.whoami.rule=Host(`whoami.docker.localhost`)"
+      - "traefik.http.routers.whoami.entrypoints=websecure"
+      - "traefik.http.routers.whoami.tls=true"
+
 
   user-service:
     # The baked image: build-image.ps1 / docker-bake.hcl tag it :<version> and :latest.
@@ -114,27 +169,59 @@ services:
     # override the datasource host: localhost to the `postgres` service on the compose network.
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/postgres
-    # No ports: the backend is reachable only through Traefik, never directly.
+    # /healthcheck is a musl-static probe baked into the image (Dockerfile +
+    # build-helper/healthcheck.c) since scratch has no shell/curl. Healthy =
+    # the app answers HTTP < 500 on :8080 (no actuator; 403 proves liveness).
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+      start_interval: 1s
+    # Exposed through Traefik (HTTPS) so the frontend's browser-side API calls
+    # have a reachable target; no host port needed.
     labels:
       - "traefik.enable=true"
-
-      # Backend listens on 8080 inside the container.
+      - "traefik.http.routers.user-service.rule=Host(`api.docker.localhost`)"
+      - "traefik.http.routers.user-service.entrypoints=websecure"
+      - "traefik.http.routers.user-service.tls=true"
       - "traefik.http.services.user-service.loadbalancer.server.port=8080"
 
-      # Strip the /api prefix so /api/users/me reaches the app as /users/me.
-      - "traefik.http.middlewares.api-strip.stripprefix.prefixes=/api"
-
-      # Assignment route: http://localhost:80/api/... (plaintext, loopback demo)
-      - "traefik.http.routers.api-web.rule=PathPrefix(`/api`)"
-      - "traefik.http.routers.api-web.entrypoints=web"
-      - "traefik.http.routers.api-web.middlewares=api-strip"
-
-      # Public route: https://auth.niichan.ch/api/... (Let's Encrypt TLS)
-      - "traefik.http.routers.api-secure.rule=Host(`auth.niichan.ch`) && PathPrefix(`/api`)"
-      - "traefik.http.routers.api-secure.entrypoints=websecure"
-      - "traefik.http.routers.api-secure.tls=true"
-      - "traefik.http.routers.api-secure.tls.certresolver=le"
-      - "traefik.http.routers.api-secure.middlewares=api-strip"
+  # Next.js auth portal (https://github.com/yagan93/auth_portal), served via
+  # Traefik at https://auth.docker.localhost. The Dockerfile pulls the source
+  # from GitHub, so nothing needs to be cloned locally.
+  frontend:
+    image: ${FRONTEND_IMAGE_NAME:-auth-portal}:${FRONTEND_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    networks:
+      - user-mgmt-net
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked into the client bundle at build time; rebuild to change it.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://api.docker.localhost}
+    # Gate on the backend actually serving (healthcheck above), not just created.
+    depends_on:
+      user-service:
+        condition: service_healthy
+    # The distroless runtime has no shell/curl, but it does have node itself,
+    # so the probe is an inline fetch. Healthy = the Next.js server answers
+    # HTTP < 500 on :3000 (PORT comes from the image env).
+    healthcheck:
+      test: ["CMD", "/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+      start_interval: 2s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=Host(`auth.docker.localhost`)"
+      - "traefik.http.routers.frontend.entrypoints=websecure"
+      - "traefik.http.routers.frontend.tls=true"
+      - "traefik.http.services.frontend.loadbalancer.server.port=3000"
 
 networks:
   user-mgmt-net:

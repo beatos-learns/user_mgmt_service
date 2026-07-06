@@ -48,6 +48,12 @@ RUN printf 'app:x:1000:1000::/tmp:/sbin/nologin\n' > /rootfs/etc/passwd
 RUN printf 'app:x:1000:\n' > /rootfs/etc/group
 RUN chmod 1777 /rootfs/tmp
 
+# Health probe for the scratch image: no shell/curl there, so the compose
+# healthcheck execs this tiny musl-static binary instead. Kept below the
+# native build so probe tweaks don't bust the expensive nativeCompile cache.
+COPY build-helper/healthcheck.c ./scripts/
+RUN x86_64-linux-musl-gcc -Os -static -o /rootfs/healthcheck scripts/healthcheck.c && strip /rootfs/healthcheck
+
 # Stage 2: runtime  | scratch = nothing
 FROM scratch
 ## Image identity, threaded in from Gradle via docker-bake.hcl (build args) so the
