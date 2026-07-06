@@ -8,10 +8,12 @@
 # Or let compose build it itself (runtime-identical, gzip layers [bigger Image]):
 #   docker compose up -d --build
 #
-# Access:
-#   http://localhost:80/api/...            -> backend (assignment requirement, plaintext loopback)
-#   https://auth.niichan.ch/api/...        -> backend (public, Let's Encrypt TLS)
-#   https://dashboard.niichan.ch           -> Traefik dashboard (basic-auth, Let's Encrypt TLS)
+# Access (TLS terminated at Traefik; HTTP is redirected to HTTPS):
+#   https://localhost/api/...              -> backend (self-signed cert locally; test with an HTTP
+#                                             client that ignores cert verification, e.g. Postman)
+#   http://localhost/api/...               -> 301 redirect to the HTTPS URL above
+#   https://auth.niichan.ch/api/...        -> backend (public, Let's Encrypt cert)
+#   https://dashboard.niichan.ch           -> Traefik dashboard (basic-auth, Let's Encrypt cert)
 # The database has no published ports and is only reachable on the internal network.
 name: user-mgmt
 
@@ -56,8 +58,13 @@ services:
       - traefik-cert:/certs
 
     command:
-      # EntryPoints
+      # EntryPoints: HTTP (80) and HTTPS (443). All HTTP traffic is permanently
+      # redirected to HTTPS (the ACME HTTP-01 challenge on /.well-known/ is served
+      # before the redirect, so certificate issuance still works).
       - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
       - "--entrypoints.websecure.address=:443"
 
       # Docker provider — nothing is routed unless it opts in with traefik.enable=true
@@ -124,12 +131,15 @@ services:
       # Strip the /api prefix so /api/users/me reaches the app as /users/me.
       - "traefik.http.middlewares.api-strip.stripprefix.prefixes=/api"
 
-      # Assignment route: http://localhost:80/api/... (plaintext, loopback demo)
-      - "traefik.http.routers.api-web.rule=PathPrefix(`/api`)"
-      - "traefik.http.routers.api-web.entrypoints=web"
-      - "traefik.http.routers.api-web.middlewares=api-strip"
+      # Local/default route: https://localhost/api/... — HTTPS only, TLS terminated
+      # by Traefik. localhost gets Traefik's default self-signed cert (Let's Encrypt
+      # cannot issue for localhost), so use an HTTP client with cert checks disabled.
+      - "traefik.http.routers.api.rule=PathPrefix(`/api`)"
+      - "traefik.http.routers.api.entrypoints=websecure"
+      - "traefik.http.routers.api.tls=true"
+      - "traefik.http.routers.api.middlewares=api-strip"
 
-      # Public route: https://auth.niichan.ch/api/... (Let's Encrypt TLS)
+      # Public route: https://auth.niichan.ch/api/... with a real Let's Encrypt cert.
       - "traefik.http.routers.api-secure.rule=Host(`auth.niichan.ch`) && PathPrefix(`/api`)"
       - "traefik.http.routers.api-secure.entrypoints=websecure"
       - "traefik.http.routers.api-secure.tls=true"
