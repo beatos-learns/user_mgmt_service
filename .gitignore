@@ -1,1 +1,4 @@
 /.env
+
+# Local course material / docs, not part of the deployable stack
+*.pdf
