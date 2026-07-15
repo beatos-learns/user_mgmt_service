@@ -2,10 +2,10 @@
 #
 # App config from .env (compose auto-loads it for ${...} interpolation)
 #
-# Recommended flow gets the zstd "baked" image (Gradle version + :latest):
-#   .\build-image.ps1            # build the baked image first
-#   docker compose up -d         # start DB, then the service once the DB is healthy
-# Or let compose build it itself (runtime-identical, gzip layers [bigger Image]):
+# Images are built and pushed by CI (.github/workflows/deploy.yaml — zstd
+# "baked" layers via docker-bake.hcl); the deploy points IMAGE_NAME/IMAGE_TAG
+# at them through .env. Compose can still build runtime-identical images
+# itself (gzip layers [bigger image]):
 #   docker compose up -d --build
 #
 # Access (TLS terminated at Traefik; HTTP is redirected to HTTPS):
@@ -15,6 +15,7 @@
 #   https://api.docker.localhost           -> backend, used by the frontend's browser-side calls
 #   https://auth.docker.localhost          -> Next.js auth portal
 #   https://auth.niichan.ch/api/...        -> backend (public, Let's Encrypt TLS)
+#   https://auth.niichan.ch                -> Next.js auth portal (public, Let's Encrypt TLS)
 #   https://dashboard.niichan.ch           -> Traefik dashboard (basic-auth, Let's Encrypt TLS)
 # The database has no published ports and is only reachable on the internal network.
 name: user-mgmt
@@ -22,6 +23,7 @@ name: user-mgmt
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     networks:
       - user-mgmt-net
     # Credentials mirror .env (SPRING_DATASOURCE_*), so the app and DB agree.
@@ -156,8 +158,9 @@ services:
 
 
   user-service:
-    # The baked image: build-image.ps1 / docker-bake.hcl tag it :<version> and :latest.
+    # The baked image: CI (docker-bake.hcl) tags it :<version> and :latest.
     image: ${IMAGE_NAME:-user-mgmt-service}:${IMAGE_TAG:-latest}
+    restart: unless-stopped
     networks:
       - user-mgmt-net
     build:
@@ -247,6 +250,15 @@ services:
       - "traefik.http.routers.frontend.entrypoints=websecure"
       - "traefik.http.routers.frontend.tls=true"
       - "traefik.http.services.frontend.loadbalancer.server.port=3000"
+
+      # Public route: https://auth.niichan.ch with a real Let's Encrypt cert.
+      # The api-secure router above outranks this host-only rule for /api
+      # paths (longer rule = higher priority), so API calls still reach the
+      # backend while everything else lands on the portal.
+      - "traefik.http.routers.frontend-secure.rule=Host(`auth.niichan.ch`)"
+      - "traefik.http.routers.frontend-secure.entrypoints=websecure"
+      - "traefik.http.routers.frontend-secure.tls=true"
+      - "traefik.http.routers.frontend-secure.tls.certresolver=le"
 
 networks:
   user-mgmt-net:

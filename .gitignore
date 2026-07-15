@@ -1,4 +1,8 @@
 /.env
 
+# Gradle build cache (created by IDE/local builds)
+/.gradle/
+
 # Local course material / docs, not part of the deployable stack
 *.pdf
+/.idea/

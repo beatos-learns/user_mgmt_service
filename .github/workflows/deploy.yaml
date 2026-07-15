@@ -1,0 +1,307 @@
+# deploy.yaml | build the images, publish them to GHCR, then (optionally)
+# deploy the compose stack to the production host over SSH.
+#
+#   version ──> build-backend  (docker buildx bake: GraalVM native, zstd layers)
+#          └──> build-frontend (Next.js auth portal)
+#                     └──> deploy (compose stack on auth.niichan.ch, via SSH)
+#
+# Versioning: pushes to main publish :sha-<short> + :latest; tags v1.2.3
+# publish :1.2.3 + :latest. The deploy pins the exact version just built,
+# never :latest, so a concurrent push can't swap images mid-deploy.
+#
+# Configuration comes from the GitHub environment `deploy-to-azzure`
+# (Settings → Environments), which holds:
+#   SSH_USER, SSH_KEY                      — SSH access to auth.niichan.ch
+#   SPRING_DATASOURCE_URL / _USERNAME / _PASSWORD, SPRING_JPA_HIBERNATE_DDL_AUTO,
+#   JWT_ISSUER, JWT_SECRET, JWT_EXPIRATION_MILLIS
+#                                          — rendered into the server's .env
+#   optional: TRAEFIK_DASHBOARD_AUTH (dashboard login), GHCR_PULL_USER/_TOKEN
+# The server's SSH host keys are pinned inline in the "Set up SSH" step.
+# Optional repo vars: NEXT_PUBLIC_API_URL, FRONTEND_REF, DEPLOY_PATH.
+#
+# The deploy self-bootstraps a fresh Debian 13 minimal install: it installs
+# Docker Engine + compose plugin (get.docker.com) when missing, grants the SSH
+# user docker access, and creates DEPLOY_PATH. SSH_USER must be root or have
+# passwordless sudo (Azure's provisioned admin user has it).
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Queue builds per ref instead of cancelling. Deploys are additionally
+# serialized across ALL refs by the deploy job's own concurrency group below
+# (a main push and a v* tag would otherwise deploy to the server in parallel).
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Derive image version
+    # Ref-guards the whole workflow (every other job needs this one): images —
+    # including the :latest tags — are only ever published from main or a v*
+    # tag, so a workflow_dispatch on a feature branch publishes nothing.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      owner: ${{ steps.ver.outputs.owner }}
+    steps:
+      - id: ver
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="sha-$(printf '%.7s' "$GITHUB_SHA")"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # GHCR image names must be lowercase.
+          echo "owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+  build-backend:
+    name: Build & push backend (native image)
+    needs: version
+    runs-on: ubuntu-latest
+    # GraalVM native compilation is slow; well under this in practice.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build & push (docker buildx bake)
+        uses: docker/bake-action@v6
+        env:
+          # docker-bake.hcl threads these into tags and OCI labels.
+          IMAGE_NAME: ghcr.io/${{ needs.version.outputs.owner }}/user-mgmt-service
+          VERSION: ${{ needs.version.outputs.version }}
+        with:
+          source: .
+          files: docker-bake.hcl
+          # Keep the bake file's zstd settings but push instead of loading into
+          # the local store (a plain `push: true` would override the output and
+          # silently drop the zstd compression flags).
+          set: |
+            app.output=type=registry,compression=zstd,compression-level=19,force-compression=true
+
+  build-frontend:
+    name: Build & push frontend (auth portal)
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          # Push with zstd-compressed layers — identical output settings to the
+          # backend bake (docker-bake.hcl). A plain `push: true` is shorthand
+          # for type=registry WITHOUT these flags, i.e. it would silently fall
+          # back to gzip layers.
+          outputs: type=registry,compression=zstd,compression-level=19,force-compression=true
+          # NEXT_PUBLIC_API_URL is baked into the client bundle at build time;
+          # the public API base is Host(auth.niichan.ch) && PathPrefix(/api).
+          # FRONTEND_REF: the portal source is git-ADDed from the external
+          # auth_portal repo — set the FRONTEND_REF variable to a commit SHA to
+          # pin it; the 'main' fallback floats on upstream, so re-runs of old
+          # runs rebuild from upstream's CURRENT main.
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL || 'https://auth.niichan.ch/api' }}
+            FRONTEND_REF=${{ vars.FRONTEND_REF || 'main' }}
+          tags: |
+            ghcr.io/${{ needs.version.outputs.owner }}/auth-portal:${{ needs.version.outputs.version }}
+            ghcr.io/${{ needs.version.outputs.owner }}/auth-portal:latest
+
+  deploy:
+    name: Deploy to auth.niichan.ch
+    needs: [version, build-backend, build-frontend]
+    # Runs on every main push and v* tag (ref-guarded via the version job).
+    # Note: anyone who can push a v* tag can deploy — protect v* with a tag
+    # ruleset if that matters.
+    # One deploy at a time across ALL refs — a main push and a v* tag push
+    # must queue, not interleave scp/compose on the same server.
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: deploy-to-azzure
+    permissions:
+      contents: read
+    env:
+      DEPLOY_HOST: auth.niichan.ch
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/user-mgmt' }}
+      # Each entry may live in the deploy-to-azzure environment as a secret or
+      # a variable — both contexts are checked; the secret wins if both exist.
+      SSH_USER: ${{ secrets.SSH_USER || vars.SSH_USER }}
+      SSH_KEY: ${{ secrets.SSH_KEY || vars.SSH_KEY }}
+      SPRING_DATASOURCE_URL: ${{ secrets.SPRING_DATASOURCE_URL || vars.SPRING_DATASOURCE_URL }}
+      SPRING_DATASOURCE_USERNAME: ${{ secrets.SPRING_DATASOURCE_USERNAME || vars.SPRING_DATASOURCE_USERNAME }}
+      SPRING_DATASOURCE_PASSWORD: ${{ secrets.SPRING_DATASOURCE_PASSWORD || vars.SPRING_DATASOURCE_PASSWORD }}
+      SPRING_JPA_HIBERNATE_DDL_AUTO: ${{ secrets.SPRING_JPA_HIBERNATE_DDL_AUTO || vars.SPRING_JPA_HIBERNATE_DDL_AUTO }}
+      JWT_ISSUER: ${{ secrets.JWT_ISSUER || vars.JWT_ISSUER }}
+      JWT_SECRET: ${{ secrets.JWT_SECRET || vars.JWT_SECRET }}
+      JWT_EXPIRATION_MILLIS: ${{ secrets.JWT_EXPIRATION_MILLIS || vars.JWT_EXPIRATION_MILLIS }}
+      TRAEFIK_DASHBOARD_AUTH: ${{ secrets.TRAEFIK_DASHBOARD_AUTH || vars.TRAEFIK_DASHBOARD_AUTH }}
+      IMAGE_NAME: ghcr.io/${{ needs.version.outputs.owner }}/user-mgmt-service
+      FRONTEND_IMAGE_NAME: ghcr.io/${{ needs.version.outputs.owner }}/auth-portal
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Verify the deploy-to-azzure environment is complete
+        run: |
+          missing=0
+          for name in SSH_USER SSH_KEY \
+                      SPRING_DATASOURCE_URL SPRING_DATASOURCE_USERNAME SPRING_DATASOURCE_PASSWORD \
+                      SPRING_JPA_HIBERNATE_DDL_AUTO JWT_ISSUER JWT_SECRET JWT_EXPIRATION_MILLIS; do
+            if [ -z "${!name}" ]; then
+              echo "::error::The deploy-to-azzure environment is missing '$name' (add it under Settings -> Environments -> deploy-to-azzure)"
+              missing=1
+            fi
+          done
+          # Not in the environment's fixed set: warn instead of failing — only
+          # the Traefik dashboard login breaks without it, not the stack.
+          if [ -z "$TRAEFIK_DASHBOARD_AUTH" ]; then
+            echo "::warning::TRAEFIK_DASHBOARD_AUTH is not set in deploy-to-azzure - the Traefik dashboard will be unreachable until it is added."
+          fi
+          exit "$missing"
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # Pinned host PUBLIC keys of auth.niichan.ch (not secrets). Pinning
+          # instead of ssh-keyscan-at-deploy-time: on an ephemeral runner a
+          # keyscan would be trust-on-EVERY-use — whoever answers for the host
+          # at deploy time would receive all production secrets. Refresh after
+          # a server reinstall with: ssh-keyscan auth.niichan.ch
+          cat > ~/.ssh/known_hosts <<'EOF'
+          auth.niichan.ch ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOSU/ECdQusRAzrmZqWTj//bTyfVxpOjLi7zxqbbSwy0
+          auth.niichan.ch ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLfz9Y5qBi/N1p+B8i8HlBki617VK3uZjOuIn/KVV2TXH6d0M7NVqeHmh/2ddpxdekc4I2YS8D0ZPP6ariBriPQ=
+          auth.niichan.ch ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDhnJajzLa8szM0ThtLxOEQIrIBFRebap0kNUvRMpi0b7gBaFjVADRdN+sdjON2wxPb1tjgnxXucp7N52CjTb6f32QndnC1DxeOfAAXWBnM43qfcWuD+NGyHIoX88WbcWmbhp3FulogwDRy0OYqkwZ4RKjM/PtRJQlum/jKRzCfx0A4F1GPJMHhZa79ROi597vnVODNeyEctMJj8s138Xl8geOD0XijJFY0OWGvC1qEWX8e8Cbn1VyUQoEGKFC9VSYgv4e9Ctqd4dxKnDKmloh7HcrggQi0FuKxcyvcwP8bsKoN+XC8GhMBPECYTFLZy9OMaaK9V6BUq3iN6atQzgMI0qyntmj1++3q5R4bpX5Pjg58VTFgKYAc9Zj6Dj0wnZ4HrznhwCBt1gsoUpNeS7XCat0+NeXvGylbuxqaxVYF6ti6RCXaWArHIXlt66TWXBwynVV21Xbo5h97KOpXIGo2h1NWkAodUbBnNXMfeQJt/tNEIP8hODM2c4LTvzu3y+k=
+          EOF
+          # Host alias so every later step can just `ssh deploy` / `scp ... deploy:`.
+          cat > ~/.ssh/config <<EOF
+          Host deploy
+            HostName $DEPLOY_HOST
+            User $SSH_USER
+            IdentityFile ~/.ssh/deploy_key
+            UserKnownHostsFile ~/.ssh/known_hosts
+            BatchMode yes
+            ConnectTimeout 10
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Bootstrap server (fresh Debian 13 minimal supported)
+        run: |
+          # Idempotent: a provisioned server falls straight through. Each later
+          # step is a NEW ssh session, so the docker group added here is
+          # already effective for them.
+          # shellcheck disable=SC2029  # DEPLOY_PATH is quoted with %q and expands client-side by design
+          ssh deploy "DEPLOY_PATH=$(printf '%q' "$DEPLOY_PATH") bash -s" <<'EOF'
+          set -euo pipefail
+          SUDO="sudo -n"
+          [ "$(id -u)" -eq 0 ] && SUDO=""
+          if [ -n "$SUDO" ] && ! $SUDO true 2>/dev/null; then
+            echo "::error::$(id -un) has no passwordless sudo - bootstrap needs root rights on a fresh server"
+            exit 1
+          fi
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "Docker not found - installing Engine + compose plugin via get.docker.com"
+            export DEBIAN_FRONTEND=noninteractive
+            $SUDO apt-get update -qq
+            $SUDO apt-get install -y -qq ca-certificates curl
+            curl -fsSL https://get.docker.com | $SUDO sh
+          fi
+          # Let the deploy user run docker without sudo (no-op for root).
+          if [ "$(id -u)" -ne 0 ] && ! id -nG "$(id -un)" | grep -qw docker; then
+            $SUDO usermod -aG docker "$(id -un)"
+          fi
+          # Stack directory owned by the deploy user (root owns /opt otherwise).
+          $SUDO install -d -o "$(id -un)" -g "$(id -gn)" -m 700 "$DEPLOY_PATH"
+          docker --version
+          EOF
+
+      - name: Render production .env
+        run: |
+          # Values come 1:1 from the deploy-to-azzure environment (job env
+          # above). Note: docker-compose.yaml overrides SPRING_DATASOURCE_URL
+          # for user-service to the in-network postgres service either way.
+          {
+            printf 'SPRING_DATASOURCE_URL=%s\n' "$SPRING_DATASOURCE_URL"
+            printf 'SPRING_DATASOURCE_USERNAME=%s\n' "$SPRING_DATASOURCE_USERNAME"
+            printf 'SPRING_DATASOURCE_PASSWORD=%s\n' "$SPRING_DATASOURCE_PASSWORD"
+            printf 'SPRING_JPA_HIBERNATE_DDL_AUTO=%s\n' "$SPRING_JPA_HIBERNATE_DDL_AUTO"
+            printf 'JWT_ISSUER=%s\n' "$JWT_ISSUER"
+            printf 'JWT_SECRET=%s\n' "$JWT_SECRET"
+            printf 'JWT_EXPIRATION_MILLIS=%s\n' "$JWT_EXPIRATION_MILLIS"
+            printf 'TRAEFIK_DASHBOARD_AUTH=%s\n' "$TRAEFIK_DASHBOARD_AUTH"
+            printf 'IMAGE_NAME=%s\n' "$IMAGE_NAME"
+            printf 'IMAGE_TAG=%s\n' "$VERSION"
+            printf 'FRONTEND_IMAGE_NAME=%s\n' "$FRONTEND_IMAGE_NAME"
+            printf 'FRONTEND_IMAGE_TAG=%s\n' "$VERSION"
+          } > deploy.env
+          # scp preserves mode bits; without this the server's .env (JWT key,
+          # DB password) would land world-readable (644 from the runner umask).
+          chmod 600 deploy.env
+
+      - name: Copy stack files to server
+        run: |
+          # DEPLOY_PATH exists (bootstrap step creates it, owner = deploy user).
+          scp docker-compose.yaml "deploy:$DEPLOY_PATH/"
+          scp deploy.env "deploy:$DEPLOY_PATH/.env"
+
+      - name: Log in to GHCR on the server (optional)
+        env:
+          GHCR_PULL_USER: ${{ secrets.GHCR_PULL_USER }}
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+        run: |
+          if [ -n "$GHCR_PULL_USER" ] && [ -n "$GHCR_PULL_TOKEN" ]; then
+            # shellcheck disable=SC2029  # $GHCR_PULL_USER expands client-side by design
+            printf '%s' "$GHCR_PULL_TOKEN" \
+              | ssh deploy "docker login ghcr.io -u '$GHCR_PULL_USER' --password-stdin"
+          else
+            echo "GHCR_PULL_USER/GHCR_PULL_TOKEN not set - assuming the packages are public."
+          fi
+
+      - name: Deploy stack
+        run: |
+          # whoami is the only service built on the server (trivial two-line
+          # image); everything else is pulled, so `up` never native-compiles.
+          # shellcheck disable=SC2029  # DEPLOY_PATH is quoted with %q and expands client-side by design
+          ssh deploy "DEPLOY_PATH=$(printf '%q' "$DEPLOY_PATH") bash -s" <<'EOF'
+          set -euo pipefail
+          cd "$DEPLOY_PATH"
+          docker compose build whoami
+          docker compose pull
+          docker compose up -d --no-build --remove-orphans
+          # Superseded images stay tagged (deploys pin unique versions, never
+          # :latest), so plain `prune` would reclaim nothing and the disk would
+          # fill up. -a removes images no container uses; `until` spares
+          # anything built in the last week (rollback headroom + base images).
+          docker image prune -af --filter "until=168h"
+          EOF
