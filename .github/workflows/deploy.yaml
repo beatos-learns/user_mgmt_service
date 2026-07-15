@@ -192,7 +192,9 @@ jobs:
       - name: Set up SSH
         run: |
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          # tr strips CR so a key copied on Windows (CRLF line endings) still
+          # parses — otherwise ssh fails with "error in libcrypto".
+          printf '%s\n' "$SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           # Pinned host PUBLIC keys of auth.niichan.ch (not secrets). Pinning
           # instead of ssh-keyscan-at-deploy-time: on an ephemeral runner a
