@@ -68,7 +68,10 @@ jobs:
   build-backend:
     name: Build & push backend (native image)
     needs: version
-    runs-on: ubuntu-latest
+    # arm64 runner (free for public repos): the server is an arm64 Azure VM,
+    # and the GraalVM native compile must run natively on the target arch —
+    # cross-building via QEMU would take hours.
+    runs-on: ubuntu-24.04-arm
     # GraalVM native compilation is slow; well under this in practice.
     timeout-minutes: 60
     permissions:
@@ -100,7 +103,8 @@ jobs:
   build-frontend:
     name: Build & push frontend (auth portal)
     needs: version
-    runs-on: ubuntu-latest
+    # arm64 to match the server architecture (see build-backend).
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     permissions:
       contents: read

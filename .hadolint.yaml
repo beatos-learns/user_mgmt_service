@@ -13,3 +13,4 @@ ignored:
 trustedRegistries:
   - ghcr.io
   - docker.io
+  - gcr.io   # distroless runtime base images

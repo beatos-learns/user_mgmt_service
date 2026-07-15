@@ -178,8 +178,8 @@ services:
     # override the datasource host: localhost to the `postgres` service on the compose network.
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/postgres
-    # /healthcheck is a musl-static probe baked into the image (Dockerfile +
-    # build-helper/healthcheck.c) since scratch has no shell/curl. Healthy =
+    # /healthcheck is a tiny C probe baked into the image (Dockerfile +
+    # build-helper/healthcheck.c) since distroless has no shell/curl. Healthy =
     # the app answers HTTP < 500 on :8080 (no actuator; 403 proves liveness).
     healthcheck:
       test: ["CMD", "/healthcheck"]
