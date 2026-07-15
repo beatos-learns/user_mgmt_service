@@ -1,9 +1,10 @@
 # deploy.yaml | build the images, publish them to GHCR, then (optionally)
 # deploy the compose stack to the production host over SSH.
 #
-#   version ──> build-backend  (docker buildx bake: GraalVM native, zstd layers)
-#          └──> build-frontend (Next.js auth portal)
-#                     └──> deploy (compose stack on auth.niichan.ch, via SSH)
+#   version ──> build-backend  (matrix: amd64 @ x86-64-v3, arm64 — native runners)
+#          └──> build-frontend (matrix: amd64, arm64)
+#                     └──> merge-manifests (:<version> + :latest multi-arch index)
+#                              └──> deploy (compose stack on auth.niichan.ch, via SSH)
 #
 # Versioning: pushes to main publish :sha-<short> + :latest; tags v1.2.3
 # publish :1.2.3 + :latest. The deploy pins the exact version just built,
@@ -66,12 +67,21 @@ jobs:
           echo "owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
   build-backend:
-    name: Build & push backend (native image)
+    name: Build backend (${{ matrix.arch }})
     needs: version
-    # arm64 runner (free for public repos): the server is an arm64 Azure VM,
-    # and the GraalVM native compile must run natively on the target arch —
-    # cross-building via QEMU would take hours.
-    runs-on: ubuntu-24.04-arm
+    # Each architecture builds natively on its own runner (the arm64 ones are
+    # free for public repos) — cross-building the GraalVM native compile via
+    # QEMU would take hours. merge-manifests unifies the per-arch tags.
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            march: x86-64-v3
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            march: ""
+    runs-on: ${{ matrix.runner }}
     # GraalVM native compilation is slow; well under this in practice.
     timeout-minutes: 60
     permissions:
@@ -96,15 +106,25 @@ jobs:
           files: docker-bake.hcl
           # Keep the bake file's zstd settings but push instead of loading into
           # the local store (a plain `push: true` would override the output and
-          # silently drop the zstd compression flags).
+          # silently drop the zstd compression flags). Tags are overridden to
+          # the per-arch tag; merge-manifests publishes :<version> and :latest.
           set: |
             app.output=type=registry,compression=zstd,compression-level=19,force-compression=true
+            app.tags=ghcr.io/${{ needs.version.outputs.owner }}/user-mgmt-service:${{ needs.version.outputs.version }}-${{ matrix.arch }}
+            app.args.NATIVE_MARCH=${{ matrix.march }}
 
   build-frontend:
-    name: Build & push frontend (auth portal)
+    name: Build frontend (${{ matrix.arch }})
     needs: version
-    # arm64 to match the server architecture (see build-backend).
-    runs-on: ubuntu-24.04-arm
+    # Native runner per architecture, same as build-backend.
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -120,6 +140,7 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: frontend
+          platforms: linux/${{ matrix.arch }}
           # Push with zstd-compressed layers — identical output settings to the
           # backend bake (docker-bake.hcl). A plain `push: true` is shorthand
           # for type=registry WITHOUT these flags, i.e. it would silently fall
@@ -135,12 +156,40 @@ jobs:
             NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL || 'https://auth.niichan.ch/api' }}
             FRONTEND_REF=${{ vars.FRONTEND_REF || 'main' }}
           tags: |
-            ghcr.io/${{ needs.version.outputs.owner }}/auth-portal:${{ needs.version.outputs.version }}
-            ghcr.io/${{ needs.version.outputs.owner }}/auth-portal:latest
+            ghcr.io/${{ needs.version.outputs.owner }}/auth-portal:${{ needs.version.outputs.version }}-${{ matrix.arch }}
+
+  merge-manifests:
+    name: Publish multi-arch manifests
+    needs: [version, build-backend, build-frontend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Merge per-arch tags into :<version> and :latest
+        env:
+          BACKEND: ghcr.io/${{ needs.version.outputs.owner }}/user-mgmt-service
+          FRONTEND: ghcr.io/${{ needs.version.outputs.owner }}/auth-portal
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # imagetools only writes manifest lists referencing the already-
+          # pushed per-arch images — layers (and their zstd compression)
+          # are untouched.
+          for image in "$BACKEND" "$FRONTEND"; do
+            docker buildx imagetools create \
+              -t "$image:$VERSION" -t "$image:latest" \
+              "$image:$VERSION-amd64" "$image:$VERSION-arm64"
+          done
 
   deploy:
     name: Deploy to auth.niichan.ch
-    needs: [version, build-backend, build-frontend]
+    needs: [version, merge-manifests]
     # Runs on every main push and v* tag (ref-guarded via the version job).
     # Note: anyone who can push a v* tag can deploy — protect v* with a tag
     # ruleset if that matters.
