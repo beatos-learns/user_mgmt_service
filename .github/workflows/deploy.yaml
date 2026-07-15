@@ -196,6 +196,22 @@ jobs:
           # parses — otherwise ssh fails with "error in libcrypto".
           printf '%s\n' "$SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
+          # Fail fast if the key is unusable, with diagnostics that are safe
+          # for a public log: parse result, line count, recognized header, and
+          # the DERIVED PUBLIC key — never private key material.
+          echo "SSH_KEY as received: $(wc -l < ~/.ssh/deploy_key) lines"
+          case "$(head -1 ~/.ssh/deploy_key)" in
+            "-----BEGIN OPENSSH PRIVATE KEY-----") echo "header: OpenSSH private key" ;;
+            "-----BEGIN "*) echo "header: PEM ($(head -1 ~/.ssh/deploy_key)) - old-style key" ;;
+            "PuTTY-User-Key-File"*) echo "header: PuTTY .ppk - NOT usable; export as OpenSSH format" ;;
+            *) echo "header: unrecognized (not shown - could be key material on one line)" ;;
+          esac
+          if ! ssh-keygen -y -P '' -f ~/.ssh/deploy_key > ~/.ssh/derived.pub 2>/tmp/keyerr; then
+            echo "::error::SSH_KEY does not parse as an unencrypted private key ($(cat /tmp/keyerr)). Paste the FULL key incl. BEGIN/END lines, OpenSSH format, no passphrase - and into the deploy-to-azzure entry the workflow reads (a stale SSH_KEY *secret* shadows a *variable* of the same name)."
+            exit 1
+          fi
+          echo "SSH_KEY parses OK - derived public key (must match deploy_key.pub on the server):"
+          cat ~/.ssh/derived.pub
           # Pinned host PUBLIC keys of auth.niichan.ch (not secrets). Pinning
           # instead of ssh-keyscan-at-deploy-time: on an ephemeral runner a
           # keyscan would be trust-on-EVERY-use — whoever answers for the host
