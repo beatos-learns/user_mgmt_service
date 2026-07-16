@@ -9,13 +9,14 @@
 #   docker compose up -d --build
 #
 # Access (TLS terminated at Traefik; HTTP is redirected to HTTPS):
-#   https://localhost/api/...              -> backend (self-signed cert locally; test with an HTTP
+#   https://localhost/api/users/...        -> backend (self-signed cert locally; test with an HTTP
 #                                             client that ignores cert verification, e.g. Postman)
-#   http://localhost/api/...               -> 301 redirect to the HTTPS URL above
+#   http://localhost/api/users/...         -> 301 redirect to the HTTPS URL above
 #   https://api.docker.localhost           -> backend, used by the frontend's browser-side calls
 #   https://auth.docker.localhost          -> Next.js auth portal
-#   https://auth.niichan.ch/api/...        -> backend (public, Let's Encrypt TLS)
-#   https://auth.niichan.ch                -> Next.js auth portal (public, Let's Encrypt TLS)
+#   https://auth.niichan.ch/api/users/...  -> backend (public, Let's Encrypt TLS)
+#   https://auth.niichan.ch                -> Next.js auth portal (public, Let's Encrypt TLS),
+#                                             including its own /api/login|me|logout route handlers
 #   https://dashboard.niichan.ch           -> Traefik dashboard (basic-auth, Let's Encrypt TLS)
 # The database has no published ports and is only reachable on the internal network.
 name: user-mgmt
@@ -54,8 +55,14 @@ services:
     security_opt:
       - no-new-privileges:true
 
+    # The alias lets containers on this network (the frontend's server-side
+    # login proxy) resolve auth.niichan.ch straight to Traefik via Docker's
+    # embedded DNS instead of hairpinning through the VM's public IP; Traefik
+    # serves the real Let's Encrypt cert by SNI, so TLS validation still passes.
     networks:
-      - user-mgmt-net
+      user-mgmt-net:
+        aliases:
+          - auth.niichan.ch
 
     ports:
       - "80:80"
@@ -200,17 +207,23 @@ services:
       # Strip the /api prefix so /api/users/me reaches the app as /users/me.
       - "traefik.http.middlewares.api-strip.stripprefix.prefixes=/api"
 
-      # Local/default route: https://localhost/api/... — HTTPS only, TLS terminated
-      # by Traefik (Aufgabe 3+4). localhost gets Traefik's default self-signed cert
-      # (Let's Encrypt cannot issue for localhost). Host-scoped routers above/below
-      # outrank this path-only rule, so *.docker.localhost traffic is unaffected.
-      - "traefik.http.routers.api.rule=PathPrefix(`/api`)"
+      # Local/default route: https://localhost/api/users/... — HTTPS only, TLS
+      # terminated by Traefik (Aufgabe 3+4). localhost gets Traefik's default
+      # self-signed cert (Let's Encrypt cannot issue for localhost). Host-scoped
+      # routers above/below outrank this path-only rule, so *.docker.localhost
+      # traffic is unaffected.
+      # Scoped to /api/users (the backend's entire HTTP surface) — a bare /api
+      # prefix would also capture the portal's own Next.js routes
+      # (/api/login|me|logout), which must reach the frontend. Don't re-widen.
+      - "traefik.http.routers.api.rule=PathPrefix(`/api/users`)"
       - "traefik.http.routers.api.entrypoints=websecure"
       - "traefik.http.routers.api.tls=true"
       - "traefik.http.routers.api.middlewares=api-strip"
 
-      # Public route: https://auth.niichan.ch/api/... with a real Let's Encrypt cert.
-      - "traefik.http.routers.api-secure.rule=Host(`auth.niichan.ch`) && PathPrefix(`/api`)"
+      # Public route: https://auth.niichan.ch/api/users/... with a real Let's
+      # Encrypt cert. Same /api/users scoping as above: /api/login|me|logout are
+      # the portal's Next.js route handlers and must fall through to it.
+      - "traefik.http.routers.api-secure.rule=Host(`auth.niichan.ch`) && PathPrefix(`/api/users`)"
       - "traefik.http.routers.api-secure.entrypoints=websecure"
       - "traefik.http.routers.api-secure.tls=true"
       - "traefik.http.routers.api-secure.tls.certresolver=le"
@@ -252,9 +265,10 @@ services:
       - "traefik.http.services.frontend.loadbalancer.server.port=3000"
 
       # Public route: https://auth.niichan.ch with a real Let's Encrypt cert.
-      # The api-secure router above outranks this host-only rule for /api
-      # paths (longer rule = higher priority), so API calls still reach the
-      # backend while everything else lands on the portal.
+      # The api-secure router above outranks this host-only rule (longer rule =
+      # higher priority) for /api/users paths only, so backend calls reach
+      # Spring while everything else — including the portal's own Next.js
+      # /api/login|me|logout handlers — lands here.
       - "traefik.http.routers.frontend-secure.rule=Host(`auth.niichan.ch`)"
       - "traefik.http.routers.frontend-secure.entrypoints=websecure"
       - "traefik.http.routers.frontend-secure.tls=true"
