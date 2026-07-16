@@ -16,7 +16,10 @@
 #   SPRING_DATASOURCE_URL / _USERNAME / _PASSWORD, SPRING_JPA_HIBERNATE_DDL_AUTO,
 #   JWT_ISSUER, JWT_SECRET, JWT_EXPIRATION_MILLIS
 #                                          — rendered into the server's .env
-#   optional: TRAEFIK_DASHBOARD_AUTH (dashboard login), GHCR_PULL_USER/_TOKEN
+#   SPRING_JPA_HIBERNATE_DDL_AUTO must be `update`: `create`/`create-drop` drop
+#   all tables on every app start, wiping the DB each deploy (verify step enforces).
+#   optional: TRAEFIK_DASHBOARD_AUTH (dashboard login), GHCR_PULL_USER/_TOKEN,
+#             ACME_EMAIL (Let's Encrypt contact; compose has a default)
 # The server's SSH host keys are pinned inline in the "Set up SSH" step.
 # Optional repo vars: NEXT_PUBLIC_API_URL, FRONTEND_REF, DEPLOY_PATH.
 #
@@ -218,6 +221,7 @@ jobs:
       JWT_SECRET: ${{ secrets.JWT_SECRET || vars.JWT_SECRET }}
       JWT_EXPIRATION_MILLIS: ${{ secrets.JWT_EXPIRATION_MILLIS || vars.JWT_EXPIRATION_MILLIS }}
       TRAEFIK_DASHBOARD_AUTH: ${{ secrets.TRAEFIK_DASHBOARD_AUTH || vars.TRAEFIK_DASHBOARD_AUTH }}
+      ACME_EMAIL: ${{ secrets.ACME_EMAIL || vars.ACME_EMAIL }}
       IMAGE_NAME: ghcr.io/${{ needs.version.outputs.owner }}/user-mgmt-service
       FRONTEND_IMAGE_NAME: ghcr.io/${{ needs.version.outputs.owner }}/auth-portal
       VERSION: ${{ needs.version.outputs.version }}
@@ -240,6 +244,15 @@ jobs:
           if [ -z "$TRAEFIK_DASHBOARD_AUTH" ]; then
             echo "::warning::TRAEFIK_DASHBOARD_AUTH is not set in deploy-to-azzure - the Traefik dashboard will be unreachable until it is added."
           fi
+          # Refuse destructive Hibernate schema modes: with `create`/`create-drop`
+          # every container start DROPS all tables, so each deploy would wipe the
+          # production database (this happened on 2026-07-16). Use `update`.
+          case "$SPRING_JPA_HIBERNATE_DDL_AUTO" in
+            create|create-drop)
+              echo "::error::SPRING_JPA_HIBERNATE_DDL_AUTO='$SPRING_JPA_HIBERNATE_DDL_AUTO' would wipe the production database on every deploy. Set it to 'update' in Settings -> Environments -> deploy-to-azzure (check both the secret and the variable - the secret wins)."
+              missing=1
+              ;;
+          esac
           exit "$missing"
 
       - name: Set up SSH
@@ -331,6 +344,8 @@ jobs:
             printf 'JWT_SECRET=%s\n' "$JWT_SECRET"
             printf 'JWT_EXPIRATION_MILLIS=%s\n' "$JWT_EXPIRATION_MILLIS"
             printf 'TRAEFIK_DASHBOARD_AUTH=%s\n' "$TRAEFIK_DASHBOARD_AUTH"
+            # Optional; when empty, compose's ${ACME_EMAIL:-...} default applies.
+            printf 'ACME_EMAIL=%s\n' "$ACME_EMAIL"
             printf 'IMAGE_NAME=%s\n' "$IMAGE_NAME"
             printf 'IMAGE_TAG=%s\n' "$VERSION"
             printf 'FRONTEND_IMAGE_NAME=%s\n' "$FRONTEND_IMAGE_NAME"

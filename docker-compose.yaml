@@ -88,8 +88,9 @@ services:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
 
-      # Let's Encrypt (ACME) via HTTP-01 challenge on the web entrypoint
-      - "--certificatesresolvers.le.acme.email=samuel.ramseier1994@gmail.com"
+      # Let's Encrypt (ACME) via HTTP-01 challenge on the web entrypoint.
+      # ACME_EMAIL comes from .env (locally) or the deploy-rendered .env (prod).
+      - "--certificatesresolvers.le.acme.email=${ACME_EMAIL:-samuel.ramseier@edu.teko.ch}"
       - "--certificatesresolvers.le.acme.storage=/certs/acme.json"
       - "--certificatesresolvers.le.acme.httpchallenge=true"
       - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
