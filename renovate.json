@@ -1,0 +1,63 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "docker:pinDigests"
+  ],
+  "timezone": "Europe/Zurich",
+  "packageRules": [
+    {
+      "description": "One weekly PR for all image digest bumps: a Dockerfile edit changes the CI buildhash and triggers one full rebuild — don't drip-feed that. docker-compose.yaml image pins ride along in the same group and deploy without a rebuild (compose is not a buildhash input).",
+      "matchDatasources": ["docker"],
+      "matchUpdateTypes": ["digest", "pinDigest"],
+      "groupName": "image digests",
+      "schedule": ["before 6am on monday"]
+    },
+    {
+      "description": "pnpm majors are held back deliberately: a new major can change install defaults/behavior against upstream auth_portal's lockfile (the v9.0 lockfile FORMAT itself spans pnpm 9-11), which would fail --frozen-lockfile on every frontend build. Bump manually after testing a frontend build with the new major.",
+      "matchDepNames": ["pnpm"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "description": "node majors must be bumped by hand: the distroless runtime line embeds the major in the repo NAME (nodejs22-debian12), which Renovate cannot bump, so a node:22-slim -> node:24-slim PR would half-bump the pair. Edit both FROM lines in frontend/Dockerfile in one commit.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["node"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "description": "Gradle lives in two managed places (ARG GRADLE_VERSION in the backend Dockerfile via the custom manager below, and gradle/wrapper/gradle-wrapper.properties via the built-in gradle-wrapper manager) — one grouped PR keeps the CI image and the local wrapper in lockstep.",
+      "matchDepNames": ["gradle"],
+      "groupName": "gradle"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Exact pnpm pin inside the frontend build image",
+      "managerFilePatterns": ["/^frontend\\/Dockerfile$/"],
+      "matchStrings": ["npm install -g pnpm@(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "depNameTemplate": "pnpm",
+      "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "description": "Gradle distribution wget-installed inside the backend build image",
+      "managerFilePatterns": ["/^Dockerfile$/"],
+      "matchStrings": ["ARG GRADLE_VERSION=(?<currentValue>\\d+\\.\\d+(?:\\.\\d+)?)"],
+      "depNameTemplate": "gradle",
+      "datasourceTemplate": "gradle-version",
+      "versioningTemplate": "gradle"
+    },
+    {
+      "customType": "regex",
+      "description": "GraalVM native build-tools Gradle plugin, sed-injected into build.gradle inside the backend Dockerfile (invisible to the built-in gradle manager)",
+      "managerFilePatterns": ["/^Dockerfile$/"],
+      "matchStrings": ["id 'org\\.graalvm\\.buildtools\\.native' version '(?<currentValue>[^']+)'"],
+      "depNameTemplate": "org.graalvm.buildtools.native",
+      "packageNameTemplate": "org.graalvm.buildtools:native-gradle-plugin",
+      "datasourceTemplate": "maven"
+    }
+  ]
+}

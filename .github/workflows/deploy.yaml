@@ -1,14 +1,37 @@
-# deploy.yaml | build the images, publish them to GHCR, then (optionally)
-# deploy the compose stack to the production host over SSH.
+# deploy.yaml | build the images, publish them to GHCR, then deploy the
+# compose stack to the production host over SSH — skipping any image whose
+# build inputs are unchanged ("buildhash").
 #
-#   version ──> build-backend  (matrix: amd64 @ x86-64-v3, arm64 — native runners)
-#          └──> build-frontend (matrix: amd64, arm64)
-#                     └──> merge-manifests (:<version> + :latest multi-arch index)
+#   version ──> build-backend  (matrix: amd64 @ x86-64-v3, arm64 — native runners;
+#          │                    SKIPPED when its buildhash image already exists)
+#          └──> build-frontend (matrix: amd64, arm64; same skip rule)
+#                     └──> merge-manifests (always: :<version> + :latest from bh-* tags)
 #                              └──> deploy (compose stack on auth.niichan.ch, via SSH)
 #
+# Buildhash: the version job hashes each image's complete build inputs (git
+# object hashes of the source trees + the resolved auth_portal commit + the
+# effective repo vars) and probes GHCR for :bh-<hash>-<arch>. Both arches
+# present -> that build job is skipped and merge-manifests re-points
+# :<version>/:latest at the existing per-arch images. Probe errors fail OPEN
+# (rebuild — a flake costs minutes, never staleness); an unresolvable
+# FRONTEND_REF fails CLOSED. Escape hatch: workflow_dispatch with
+# force_rebuild=true (also the recovery if a deploy ever fails pulling
+# :<version> with "manifest unknown").
+# NEVER point a "delete untagged versions" GHCR cleaner at these packages:
+# the :<version> manifest lists reference the bh-* per-arch images by digest,
+# and naive cleaners break historical version pulls (rollbacks).
+# Base images are digest-pinned in both Dockerfiles and pnpm is exact-pinned
+# (renovate.json keeps them fresh via PRs): an upstream update becomes a
+# Dockerfile edit -> new buildhash -> rebuild, instead of floating invisibly
+# past the skip. force_rebuild remains the manual override for anything that
+# still floats (e.g. wget/binutils via microdnf inside the builder stage).
+#
 # Versioning: pushes to main publish :sha-<short> + :latest; tags v1.2.3
-# publish :1.2.3 + :latest. The deploy pins the exact version just built,
-# never :latest, so a concurrent push can't swap images mid-deploy.
+# publish :1.2.3 + :latest. The deploy pins the exact version just published,
+# never :latest, so a concurrent push can't swap images mid-deploy. A v* tag
+# on an already-built commit skips both builds (the frontend: provided its
+# upstream ref and vars are unchanged since the main build) and is
+# retag + deploy only.
 #
 # Configuration comes from the GitHub environment `deploy-to-azzure`
 # (Settings → Environments), which holds:
@@ -22,6 +45,9 @@
 #             ACME_EMAIL (Let's Encrypt contact; compose has a default)
 # The server's SSH host keys are pinned inline in the "Set up SSH" step.
 # Optional repo vars: NEXT_PUBLIC_API_URL, FRONTEND_REF, DEPLOY_PATH.
+# NEXT_PUBLIC_API_URL / FRONTEND_REF are buildhash inputs: editing a var does
+# not trigger a run, but the NEXT push (or a workflow_dispatch) detects the
+# changed hash and rebuilds the frontend — no silent-stale window.
 #
 # The deploy self-bootstraps a fresh Debian 13 minimal install: it installs
 # Docker Engine + compose plugin (get.docker.com) when missing, grants the SSH
@@ -34,6 +60,11 @@ on:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Rebuild both images even if their buildhash already exists in GHCR"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -47,16 +78,26 @@ concurrency:
 
 jobs:
   version:
-    name: Derive image version
+    name: Derive version & build plan
     # Ref-guards the whole workflow (every other job needs this one): images —
     # including the :latest tags — are only ever published from main or a v*
     # tag, so a workflow_dispatch on a feature branch publishes nothing.
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read # GHCR buildhash existence probe
     outputs:
       version: ${{ steps.ver.outputs.version }}
       owner: ${{ steps.ver.outputs.owner }}
+      backend_hash: ${{ steps.hash.outputs.backend_hash }}
+      frontend_hash: ${{ steps.hash.outputs.frontend_hash }}
+      frontend_sha: ${{ steps.hash.outputs.frontend_sha }}
+      frontend_repo: ${{ steps.hash.outputs.frontend_repo }}
+      api_url: ${{ steps.hash.outputs.api_url }}
+      backend_skip: ${{ steps.exists.outputs.backend_skip }}
+      frontend_skip: ${{ steps.exists.outputs.frontend_skip }}
     steps:
       - id: ver
         run: |
@@ -69,9 +110,157 @@ jobs:
           # GHCR image names must be lowercase.
           echo "owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
+      - uses: actions/checkout@v5
+
+      - name: Compute buildhashes
+        id: hash
+        env:
+          RAW_REF: ${{ vars.FRONTEND_REF || 'main' }}
+          API_URL: ${{ vars.NEXT_PUBLIC_API_URL || 'https://auth.niichan.ch/api' }}
+          # Single source for the portal repo URL: ls-remote resolves against
+          # it AND build-frontend receives it as a build-arg, so the resolved
+          # SHA and the fetched repo can never disagree.
+          FRONTEND_REPO: https://github.com/yagan93/auth_portal.git
+        run: |
+          set -euo pipefail
+          # Resolve the external frontend source to a full commit SHA. The SHA
+          # is a buildhash input AND the FRONTEND_REF build-arg, so the image
+          # that gets built is exactly the commit that was hashed. Fail CLOSED
+          # when unresolvable: a garbage ref must neither skip nor float.
+          sha=""
+          reachable=false
+          if echo "$RAW_REF" | grep -qE '^[0-9a-f]{40}$'; then
+            sha="$RAW_REF"
+          else
+            for attempt in 1 2 3; do
+              # One call for all candidate refs; prefer branch, then peeled
+              # annotated tag (^{} = the tagged COMMIT — the build needs a
+              # commit SHA, not a tag object), then lightweight tag.
+              # ls-remote prints nothing and exits 0 for a missing ref, so the
+              # retries only cover transport errors (nonzero exit).
+              if out=$(timeout 30 git ls-remote "$FRONTEND_REPO" \
+                         "refs/heads/$RAW_REF" "refs/tags/$RAW_REF" "refs/tags/$RAW_REF^{}"); then
+                reachable=true
+                sha=$(awk -v r="refs/heads/$RAW_REF" '$2==r{print $1; exit}' <<<"$out")
+                [ -n "$sha" ] || sha=$(awk '$2 ~ /\^\{\}$/{print $1; exit}' <<<"$out")
+                [ -n "$sha" ] || sha=$(awk -v r="refs/tags/$RAW_REF" '$2==r{print $1; exit}' <<<"$out")
+                break
+              fi
+              if [ "$attempt" -lt 3 ]; then sleep 5; fi
+            done
+          fi
+          if [ -z "$sha" ]; then
+            if [ "$reachable" = "true" ]; then
+              echo "::error::FRONTEND_REF '$RAW_REF' does not resolve in $FRONTEND_REPO (branch, tag, or full 40-char commit SHA)"
+            else
+              echo "::error::could not reach $FRONTEND_REPO after 3 attempts (network or repo visibility) - refusing to guess the frontend source"
+            fi
+            exit 1
+          fi
+          # Buildhash = sha256 over git OBJECT hashes of every input that can
+          # change image bytes (tree hashes cover content, names, and modes
+          # recursively, and work on a depth-1 checkout), plus the non-git
+          # inputs as literal lines.
+          # MAINTENANCE RULE: a new COPY/ADD source in a Dockerfile that is
+          # not under an already-hashed path MUST be added here — the
+          # Dockerfile edit itself rebuilds once, but LATER changes to the new
+          # path would otherwise be missed (silent stale deploy). Bump the
+          # schema=N line to force a one-time global rebuild when the input
+          # set itself changes. .gitattributes (eol rules change checked-out
+          # bytes) and a future .dockerignore (changes what the backend's `.`
+          # context includes) are inputs too; .github/workflows is hashed as a
+          # TREE so a workflow rename cannot wedge the rev-parse. Excluded on
+          # purpose: the gradle wrapper (the image wget-installs Gradle) and
+          # docker-compose.yaml (deploy-time config, never image content).
+          #
+          # The load-bearing paths resolve in plain assignments, NOT inside the
+          # hash pipeline: set -e fails the job loudly there if one is renamed
+          # or removed — inside $(... | sha256sum) errexit is cleared and a
+          # rev-parse failure would yield a stable-but-PARTIAL hash whose probe
+          # then silently skips real changes. .gitattributes/.dockerignore may
+          # legitimately not exist, so they get deterministic sentinels
+          # (removal = hash change = one rebuild) instead of a hard failure.
+          backend_objs=$(git rev-parse HEAD:Dockerfile HEAD:build.gradle HEAD:settings.gradle \
+                                       HEAD:build-helper HEAD:src HEAD:docker-bake.hcl \
+                                       HEAD:.github/workflows)
+          frontend_objs=$(git rev-parse HEAD:frontend HEAD:.github/workflows)
+          gitattributes=$(git rev-parse --verify --quiet HEAD:.gitattributes || echo "no-gitattributes")
+          dockerignore=$(git rev-parse --verify --quiet HEAD:.dockerignore || echo "no-dockerignore")
+          backend_hash=$(printf '%s\n' "backend-schema=1" "$backend_objs" \
+                                       "$gitattributes" "$dockerignore" \
+                         | sha256sum | cut -c1-16)
+          frontend_hash=$(printf '%s\n' "frontend-schema=1" "$frontend_objs" "$gitattributes" \
+                                        "repo=$FRONTEND_REPO" "frontend_sha=$sha" "api_url=$API_URL" \
+                          | sha256sum | cut -c1-16)
+          { echo "backend_hash=$backend_hash"
+            echo "frontend_hash=$frontend_hash"
+            echo "frontend_sha=$sha"
+            echo "frontend_repo=$FRONTEND_REPO"
+            echo "api_url=$API_URL"
+          } >> "$GITHUB_OUTPUT"
+
+      # Lets the probe read the packages if they are ever made private;
+      # continue-on-error because the probe fails open anyway (any error =>
+      # rebuild) and public packages inspect fine anonymously.
+      - uses: docker/login-action@v3
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Probe GHCR for existing buildhash images
+        id: exists
+        env:
+          BACKEND: ghcr.io/${{ steps.ver.outputs.owner }}/user-mgmt-service
+          FRONTEND: ghcr.io/${{ steps.ver.outputs.owner }}/auth-portal
+          BH: ${{ steps.hash.outputs.backend_hash }}
+          FH: ${{ steps.hash.outputs.frontend_hash }}
+          FORCE: ${{ inputs.force_rebuild == true }}
+        run: |
+          set -uo pipefail
+          # The runner's default shell is `bash -e`; drop errexit explicitly.
+          # This step must NEVER fail the job: every error must map to
+          # skip=false (rebuild) — fail open, enforced by the if ! guards.
+          set +e
+          # skip=true only if BOTH arch manifests exist. ANY inspect failure
+          # (manifest unknown, auth, timeout, 5xx) => false => rebuild: fail
+          # OPEN — a registry flake costs wall-clock, never staleness. The
+          # notices below keep a persistent problem (an image-name typo would
+          # cause eternal rebuilds) visible in the run annotations.
+          : > probe.log
+          probe() {
+            local img=$1 h=$2 arch
+            if [ "$FORCE" = "true" ]; then
+              echo "force_rebuild requested - ignoring any existing $img:bh-$h-*" >> probe.log
+              echo false; return
+            fi
+            for arch in amd64 arm64; do
+              if ! timeout 30 docker buildx imagetools inspect "$img:bh-$h-$arch" >/dev/null 2>>probe.log; then
+                echo "$img:bh-$h-$arch missing or unreadable - will build" >> probe.log
+                echo false; return
+              fi
+            done
+            echo true
+          }
+          backend_skip=$(probe "$BACKEND" "$BH")
+          frontend_skip=$(probe "$FRONTEND" "$FH")
+          # Workflow commands are only reliable on the step's own stdout, not
+          # from inside command substitutions — annotate after the fact.
+          while IFS= read -r line; do echo "::notice::$line"; done < probe.log
+          echo "backend probe: skip=$backend_skip ($BACKEND:bh-$BH-*)"
+          echo "frontend probe: skip=$frontend_skip ($FRONTEND:bh-$FH-*)"
+          echo "backend_skip=$backend_skip" >> "$GITHUB_OUTPUT"
+          echo "frontend_skip=$frontend_skip" >> "$GITHUB_OUTPUT"
+
   build-backend:
     name: Build backend (${{ matrix.arch }})
     needs: version
+    # Skipped entirely when this buildhash already exists in GHCR. Job-level
+    # if: costs zero runner time; no status function in the expression, so the
+    # implicit success() gate on `version` still applies (a failed or
+    # ref-guard-skipped version job skips the builds too).
+    if: needs.version.outputs.backend_skip != 'true'
     # Each architecture builds natively on its own runner (the arm64 ones are
     # free for public repos) — cross-building the GraalVM native compile via
     # QEMU would take hours. merge-manifests unifies the per-arch tags.
@@ -103,22 +292,27 @@ jobs:
         env:
           # docker-bake.hcl threads these into tags and OCI labels.
           IMAGE_NAME: ghcr.io/${{ needs.version.outputs.owner }}/user-mgmt-service
-          VERSION: ${{ needs.version.outputs.version }}
+          # The OCI version label is the CONTENT identity (buildhash), not the
+          # release version: a skipped run re-points :<version> at an image
+          # built earlier, so a release-version label would lie on reuse.
+          VERSION: bh-${{ needs.version.outputs.backend_hash }}
         with:
           source: .
           files: docker-bake.hcl
           # Keep the bake file's zstd settings but push instead of loading into
           # the local store (a plain `push: true` would override the output and
-          # silently drop the zstd compression flags). Tags are overridden to
-          # the per-arch tag; merge-manifests publishes :<version> and :latest.
+          # silently drop the zstd compression flags). Tags are the per-arch
+          # CONTENT tags (bh-*); merge-manifests publishes :<version>/:latest.
           set: |
             app.output=type=registry,compression=zstd,compression-level=19,force-compression=true
-            app.tags=ghcr.io/${{ needs.version.outputs.owner }}/user-mgmt-service:${{ needs.version.outputs.version }}-${{ matrix.arch }}
+            app.tags=ghcr.io/${{ needs.version.outputs.owner }}/user-mgmt-service:bh-${{ needs.version.outputs.backend_hash }}-${{ matrix.arch }}
             app.args.NATIVE_MARCH=${{ matrix.march }}
 
   build-frontend:
     name: Build frontend (${{ matrix.arch }})
     needs: version
+    # Same skip rule as build-backend.
+    if: needs.version.outputs.frontend_skip != 'true'
     # Native runner per architecture, same as build-backend.
     strategy:
       matrix:
@@ -149,21 +343,33 @@ jobs:
           # for type=registry WITHOUT these flags, i.e. it would silently fall
           # back to gzip layers.
           outputs: type=registry,compression=zstd,compression-level=19,force-compression=true
-          # NEXT_PUBLIC_API_URL is baked into the client bundle at build time;
-          # the public API base is Host(auth.niichan.ch) && PathPrefix(/api).
-          # FRONTEND_REF: the portal source is git-ADDed from the external
-          # auth_portal repo — set the FRONTEND_REF variable to a commit SHA to
-          # pin it; the 'main' fallback floats on upstream, so re-runs of old
-          # runs rebuild from upstream's CURRENT main.
+          # Every input comes from the version job's outputs — never re-read
+          # from vars here — so the built image provably matches the hashed
+          # inputs. FRONTEND_REF is the resolved 40-char commit SHA: BuildKit's
+          # git ADD takes branches/tags/full SHAs (not abbreviated ones), but
+          # only a full SHA pins the build to exactly the commit that was
+          # hashed. NEXT_PUBLIC_API_URL is baked into the client
+          # bundle at build time; the public API base is
+          # Host(auth.niichan.ch) && PathPrefix(/api).
           build-args: |
-            NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL || 'https://auth.niichan.ch/api' }}
-            FRONTEND_REF=${{ vars.FRONTEND_REF || 'main' }}
+            NEXT_PUBLIC_API_URL=${{ needs.version.outputs.api_url }}
+            FRONTEND_REF=${{ needs.version.outputs.frontend_sha }}
+            FRONTEND_REPO=${{ needs.version.outputs.frontend_repo }}
           tags: |
-            ghcr.io/${{ needs.version.outputs.owner }}/auth-portal:${{ needs.version.outputs.version }}-${{ matrix.arch }}
+            ghcr.io/${{ needs.version.outputs.owner }}/auth-portal:bh-${{ needs.version.outputs.frontend_hash }}-${{ matrix.arch }}
 
   merge-manifests:
     name: Publish multi-arch manifests
     needs: [version, build-backend, build-frontend]
+    # Must run when builds were SKIPPED-because-cached and block when one
+    # FAILED: !cancelled() disables the implicit success() gate (which treats
+    # skipped needs as failure and would cascade the skip), the explicit
+    # result checks re-impose "no failure, no cancellation" for EVERY need.
+    if: >-
+      ${{ !cancelled() &&
+          needs.version.result == 'success' &&
+          contains(fromJSON('["success","skipped"]'), needs.build-backend.result) &&
+          contains(fromJSON('["success","skipped"]'), needs.build-frontend.result) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -175,25 +381,40 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Merge per-arch tags into :<version> and :latest
+      - name: Merge buildhash tags into :<version> and :latest
         env:
           BACKEND: ghcr.io/${{ needs.version.outputs.owner }}/user-mgmt-service
           FRONTEND: ghcr.io/${{ needs.version.outputs.owner }}/auth-portal
           VERSION: ${{ needs.version.outputs.version }}
+          BH: ${{ needs.version.outputs.backend_hash }}
+          FH: ${{ needs.version.outputs.frontend_hash }}
         run: |
           # imagetools only writes manifest lists referencing the already-
-          # pushed per-arch images — layers (and their zstd compression)
-          # are untouched.
-          for image in "$BACKEND" "$FRONTEND"; do
-            docker buildx imagetools create \
-              -t "$image:$VERSION" -t "$image:latest" \
-              "$image:$VERSION-amd64" "$image:$VERSION-arm64"
-          done
+          # pushed per-arch images — layers (and their zstd compression) are
+          # untouched. Works identically whether the bh images were pushed by
+          # this run or reused from an earlier one, and fails loudly if a
+          # source manifest is missing — a broken :<version> is never
+          # published, which is what gates the deploy.
+          docker buildx imagetools create \
+            -t "$BACKEND:$VERSION" -t "$BACKEND:latest" \
+            "$BACKEND:bh-$BH-amd64" "$BACKEND:bh-$BH-arm64"
+          docker buildx imagetools create \
+            -t "$FRONTEND:$VERSION" -t "$FRONTEND:latest" \
+            "$FRONTEND:bh-$FH-amd64" "$FRONTEND:bh-$FH-arm64"
 
   deploy:
     name: Deploy to auth.niichan.ch
     needs: [version, merge-manifests]
     # Runs on every main push and v* tag (ref-guarded via the version job).
+    # Explicit gate — REQUIRED, do not remove: the implicit success() looks at
+    # ANCESTOR jobs, so with both builds skipped-because-cached the deploy
+    # would silently skip too (actions/runner#2205) even though
+    # merge-manifests succeeded. !cancelled() disables that; the result checks
+    # keep the real contract: deploy iff :<version> was published this run.
+    if: >-
+      ${{ !cancelled() &&
+          needs.version.result == 'success' &&
+          needs.merge-manifests.result == 'success' }}
     # Note: anyone who can push a v* tag can deploy — protect v* with a tag
     # ruleset if that matters.
     # One deploy at a time across ALL refs — a main push and a v* tag push

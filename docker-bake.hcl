@@ -1,5 +1,11 @@
 # docker-bake.hcl | build the GraalVM native image with zstd-compressed layers.
 # zstd layers run directly on a daemon with the containerd image store.
+#
+# The tags below serve LOCAL builds. CI (deploy.yaml) overrides them via
+# `set:` to a per-arch content tag (:bh-<buildhash>-<arch>) and passes
+# VERSION=bh-<buildhash>, so the OCI version label identifies the image
+# CONTENT — release tags (:<version>/:latest) are separate manifest lists
+# created by the merge-manifests job, re-pointable without rebuilding.
 
 variable "IMAGE_NAME" {
   default = "user-mgmt-service"

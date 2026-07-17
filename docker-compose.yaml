@@ -166,7 +166,9 @@ services:
 
 
   user-service:
-    # The baked image: CI (docker-bake.hcl) tags it :<version> and :latest.
+    # The baked image: CI pushes per-arch bh-<buildhash> content tags
+    # (docker-bake.hcl) and publishes :<version> + :latest manifest lists
+    # from them (deploy.yaml merge-manifests).
     image: ${IMAGE_NAME:-user-mgmt-service}:${IMAGE_TAG:-latest}
     restart: unless-stopped
     networks:
