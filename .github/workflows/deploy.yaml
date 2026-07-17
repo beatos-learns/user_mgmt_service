@@ -578,8 +578,21 @@ jobs:
 
       - name: Copy stack files to server
         run: |
+          # The compose file is >50% comments; the server copy doesn't need
+          # them. yq (preinstalled on the runner) re-emits the PARSED yaml
+          # with every comment stripped ('...' visits all nodes, including
+          # key-attached comments — plain '..' misses those) — unlike a
+          # sed/grep strip it cannot corrupt block scalars or values that
+          # contain '#'. The repo file stays the documented source of truth.
+          yq eval '... comments=""' docker-compose.yaml > docker-compose.deploy.yaml
+          # Refuse to ship a stripped file that no longer parses as compose.
+          # The temporary .env satisfies both interpolation and the
+          # user-service `env_file: .env` reference during validation.
+          cp deploy.env .env
+          docker compose -f docker-compose.deploy.yaml config -q
+          rm .env
           # DEPLOY_PATH exists (bootstrap step creates it, owner = deploy user).
-          scp docker-compose.yaml "deploy:$DEPLOY_PATH/"
+          scp docker-compose.deploy.yaml "deploy:$DEPLOY_PATH/docker-compose.yaml"
           scp deploy.env "deploy:$DEPLOY_PATH/.env"
 
       - name: Log in to GHCR on the server (optional)
