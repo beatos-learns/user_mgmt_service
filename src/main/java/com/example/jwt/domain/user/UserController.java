@@ -70,4 +70,18 @@ public class UserController {
     userService.deleteById(id);
     return ResponseEntity.noContent().build();
   }
+
+  @PostMapping("/{id}/modules/{moduleId}")
+  @PreAuthorize("#id == authentication.principal.user.id || hasAuthority('USER_MODIFY')")
+  public ResponseEntity<UserDTO> assignModule(@PathVariable UUID id,
+      @PathVariable UUID moduleId) {
+    return ResponseEntity.ok(userMapper.toDTO(userService.assignModule(id, moduleId)));
+  }
+
+  @DeleteMapping("/{id}/modules/{moduleId}")
+  @PreAuthorize("#id == authentication.principal.user.id || hasAuthority('USER_MODIFY')")
+  public ResponseEntity<UserDTO> unassignModule(@PathVariable UUID id,
+      @PathVariable UUID moduleId) {
+    return ResponseEntity.ok(userMapper.toDTO(userService.unassignModule(id, moduleId)));
+  }
 }

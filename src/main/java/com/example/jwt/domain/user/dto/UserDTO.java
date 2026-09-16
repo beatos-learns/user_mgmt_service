@@ -19,6 +19,8 @@ public class UserDTO extends ExtendedDTO {
   @Valid
   private Set<RoleDTO> roles;
 
+  private Set<UUID> moduleIds;
+
   public UserDTO() {
   }
 
@@ -63,6 +65,15 @@ public class UserDTO extends ExtendedDTO {
 
   public UserDTO setRoles(Set<RoleDTO> roles) {
     this.roles = roles;
+    return this;
+  }
+
+  public Set<UUID> getModuleIds() {
+    return moduleIds;
+  }
+
+  public UserDTO setModuleIds(Set<UUID> moduleIds) {
+    this.moduleIds = moduleIds;
     return this;
   }
 }

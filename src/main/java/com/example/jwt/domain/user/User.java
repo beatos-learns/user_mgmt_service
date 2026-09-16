@@ -2,7 +2,9 @@ package com.example.jwt.domain.user;
 
 import com.example.jwt.core.generic.ExtendedAuditEntity;
 import com.example.jwt.domain.role.Role;
+import jakarta.persistence.CollectionTable;
 import jakarta.persistence.Column;
+import jakarta.persistence.ElementCollection;
 import jakarta.persistence.Entity;
 import jakarta.persistence.FetchType;
 import jakarta.persistence.JoinColumn;
@@ -12,6 +14,8 @@ import jakarta.persistence.Table;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
+import org.hibernate.annotations.Fetch;
+import org.hibernate.annotations.FetchMode;
 
 @Entity
 @Table(name = "users")
@@ -36,6 +40,12 @@ public class User extends ExtendedAuditEntity {
       inverseJoinColumns = @JoinColumn(name = "role_id", referencedColumnName = "id")
   )
   private Set<Role> roles = new HashSet<>();
+
+  @ElementCollection(fetch = FetchType.EAGER)
+  @Fetch(FetchMode.SELECT)
+  @CollectionTable(name = "users_module", joinColumns = @JoinColumn(name = "users_id"))
+  @Column(name = "module_id")
+  private Set<UUID> moduleIds = new HashSet<>();
 
   public User() {
   }
@@ -92,6 +102,15 @@ public class User extends ExtendedAuditEntity {
 
   public User setRoles(Set<Role> roles) {
     this.roles = roles;
+    return this;
+  }
+
+  public Set<UUID> getModuleIds() {
+    return moduleIds;
+  }
+
+  public User setModuleIds(Set<UUID> moduleIds) {
+    this.moduleIds = moduleIds;
     return this;
   }
 }
