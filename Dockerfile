@@ -40,7 +40,7 @@ WORKDIR /build
 COPY build.gradle settings.gradle ./
 
 ## GraalVM native-image configuration + dependency-priming task.
-RUN sed -i "/id 'org.springframework.boot'/a id 'org.graalvm.buildtools.native' version '1.1.0'" build.gradle
+RUN sed -i "/id 'org.springframework.boot'/a id 'org.graalvm.buildtools.native' version '1.1.14'" build.gradle
 RUN cat >> build.gradle <<'EOF'
 
 graalvmNative {
