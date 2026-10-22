@@ -25,7 +25,7 @@ LABEL authors="Beat,Oli,Sämi"
 RUN microdnf install -y unzip wget binutils && microdnf clean all
 ## One layer for fetch+unpack+link+delete: the ~135 MB distribution zip must
 ## not persist as a dead layer in every cache.
-ARG GRADLE_VERSION=9.0.0
+ARG GRADLE_VERSION=9.8.2
 RUN wget -q https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip -O /tmp/gradle.zip \
  && unzip -q /tmp/gradle.zip -d /opt \
  && ln -s /opt/gradle-${GRADLE_VERSION}/bin/gradle /usr/local/bin/gradle \
