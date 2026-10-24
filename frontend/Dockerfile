@@ -41,7 +41,7 @@ ENV NEXT_TELEMETRY_DISABLED=1
 # bump manually after testing a frontend build.
 # Deliberately ABOVE the git ADD: this layer keys only on the base image +
 # the version string, so upstream commits never reinstall pnpm.
-RUN npm install -g pnpm@10.34.5
+RUN npm install -g pnpm@10.34.8
 
 WORKDIR /app
 # BuildKit's git-remote ADD has no COPY equivalent — DL3020 is a false positive here.
